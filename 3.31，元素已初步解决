@@ -973,10 +973,16 @@ while True:
                                    sensor_data.direction_kp,sensor_data.direction_kp2,
                                    sensor_data.direction_kd,sensor_data.direction_kd2)
         data_flag = wireless.data_analysis()
-#         sensor_data.angle_pid.kp = wireless.get_data(0)
-#         sensor_data.angle_pid.kd = wireless.get_data(1)
-#         sensor_data.gyro_pid.kp = wireless.get_data(2)
-#         sensor_data.gyro_pid.ki = wireless.get_data(3)
+        sensor_data.speed_pid.kp = wireless.get_data(0)
+        sensor_data.angle_pid.kp = wireless.get_data(1)
+        sensor_data.angle_pid.kd = wireless.get_data(2)
+        sensor_data.gyro_pid.kp = wireless.get_data(3)
+        sensor_data.gyro_pid.ki = wireless.get_data(4)
+        sensor_data.direction_kp = wireless.get_data(5)
+        sensor_data.direction_kp2 = wireless.get_data(6)
+        sensor_data.direction_kd = wireless.get_data(7)
+        sensor_data.direction_kd2 = wireless.get_data(8)
+
 
     if (ticker_flag and ticker_count % 5 == 0): #显示  200ms
         if (ticker_flag and ticker_count % 50 == 0):    #1s清屏一次
