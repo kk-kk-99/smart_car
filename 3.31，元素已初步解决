@@ -176,7 +176,7 @@ class PID:
 class SensorData:
     def __init__(self):
         # IMU Data
-        self.imu_raw = [0]*6
+        self.imu_raw = [0]*9
         self.filtered_angle = 0.0
         self.gyro = [0.0]*3
         
