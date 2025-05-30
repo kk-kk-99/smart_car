@@ -1,0 +1,1272 @@
+#CCD用的3和4，
+#imudata0是俯仰加速度，1是翻滚加速度，
+# 本示例程序演示如何通过 boot.py 文件进行 soft-boot 控制后执行自己的源文件
+# 使用 RT1021-MicroPython 核心板搭配对应拓展学习板的拨码开关控制
+
+# 示例程序运行效果为复位后执行本文件 通过 D8 电平状态跳转执行 user_main.py
+# C4 LED 会一秒周期闪烁
+# 当 D9 引脚电平出现变化时退出测试程序
+
+# 从 machine 库包含所有内容
+from machine import *
+# 从 seekfree 库包含 MOTOR_CONTROLLER
+from seekfree import MOTOR_CONTROLLER
+# 包含 display 库
+from display import *
+# 从 smartcar 库包含 ticker encoder
+from smartcar import ticker
+from smartcar import encoder
+# 从 seekfree 库包含 IMU963RX
+from seekfree import IMU963RX
+# 从 seekfree 库包含 KEY_HANDLER
+from seekfree import KEY_HANDLER
+# 从 seekfree 库包含 WIRELESS_UART
+from seekfree import WIRELESS_UART
+# 从 seekfree 库包含 TSL1401
+from seekfree import TSL1401
+# 从 seekfree 库包含 DL1X
+from seekfree import DL1X
+
+
+# 包含 gc 与 time 类
+import gc
+import time
+# import utime 需要测中断时间的时候打开
+import math
+# import sys可能用的上
+
+key_data = [0] * 4
+
+
+
+
+#一些定义和初始化----------------------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------------------
+
+# 核心板上 C4 是 LED
+# 学习板上 D9  对应二号拨码开关
+
+# 调用 machine 库的 Pin 类实例化一个引脚对象
+# 配置参数为 引脚名称 引脚方向 模式配置 默认电平
+# 详细内容参考 固件接口说明
+led     = Pin('C4' , Pin.OUT, pull = Pin.PULL_UP_47K, value = True)
+switch2 = Pin('D9' , Pin.IN , pull = Pin.PULL_UP_47K, value = True)
+state2  = switch2.value()
+
+switch3 = Pin('D18', Pin.IN, pull = Pin.PULL_UP_47K, value = True)
+switch4 = Pin('D19', Pin.IN, pull = Pin.PULL_UP_47K, value = True)
+state3  = switch3.value()
+state4  = switch4.value()
+
+#print出来看看
+# print("{:>6d}.".format(state2))
+# print("{:>6d}.".format(state3))
+# print("{:>6d}.".format(state4))
+
+
+# 按键添加
+#暂时还没用
+#key5 = Pin('D22', Pin.IN, pull=Pin.PULL_UP_47K, value=True)  # KEY1
+
+##屏幕初始化
+# 定义片选引脚
+cs = Pin('B29' , Pin.OUT, pull=Pin.PULL_UP_47K, value=1)
+# 拉高拉低一次 CS 片选确保屏幕通信时序正常
+cs.high()
+cs.low()
+
+# # 初始化串口
+uart = UART(5)                         # 使用UART5
+uart.init(115200, bits=8, parity=None, stop=1)  # 配置要和OpenMV一致
+uart.write(b'E')
+
+# 定义控制引脚
+beep = Pin('D24', Pin.OUT, pull = Pin.PULL_UP_47K, value = False)
+rst = Pin('B31', Pin.OUT, pull=Pin.PULL_UP_47K, value=1)
+dc  = Pin('B5' , Pin.OUT, pull=Pin.PULL_UP_47K, value=1)
+blk = Pin('C21', Pin.OUT, pull=Pin.PULL_UP_47K, value=1)
+
+
+# 新建 LCD 驱动实例 这里的索引范围与 SPI 示例一致 当前仅支持 IPS200
+drv = LCD_Drv(SPI_INDEX=2, BAUDRATE=60000000, DC_PIN=dc, RST_PIN=rst, LCD_TYPE=LCD_Drv.LCD200_TYPE)
+# 新建 LCD 实例
+lcd = LCD(drv)
+# color 接口设置屏幕显示颜色 [前景色,背景色]
+lcd.color(0xFFFF, 0x0000)
+# mode 接口设置屏幕显示模式 [0:竖屏,1:横屏,2:竖屏180旋转,3:横屏180旋转]
+lcd.mode(2)
+# 清屏 不传入参数就使用当前的 背景色 清屏
+# 传入 RGB565 格式参数会直接把传入的颜色设置为背景色 然后清屏
+lcd.clear(0x0000)
+
+#串口初始化
+wireless = WIRELESS_UART(115200)
+data_wave = [0,0,0,0,0,0,0,0]
+
+
+
+# # data_analysis 数据解析接口 适配逐飞助手的无线调参功能
+# data_flag = wireless.data_analysis()
+
+# for i in range(0,8):
+#     # get_data 获取调参通道数据 只有一个参数范围 [0-7]
+#     data_wave[i] = wireless.get_data(i)
+
+#CCD初始化
+ccd = TSL1401() #曝光时间，数值越大，越适用于光线越暗的地方
+ccd.set_resolution(TSL1401.RES_8BIT)
+#电机
+motor_3 = MOTOR_CONTROLLER(MOTOR_CONTROLLER.PWM_D4_DIR_D5  , 13000, duty = 0, invert = False)   #左轮   死区425
+motor_4 = MOTOR_CONTROLLER(MOTOR_CONTROLLER.PWM_D6_DIR_D7  , 13000, duty = 0, invert = True)   #右轮   死区475
+#此时编码器接的
+encoder_3 = encoder("C2" , "C3" , True)
+encoder_4 = encoder("C0" , "C1" )
+#imu初始化
+imu = IMU963RX()
+#按键初始化
+key = KEY_HANDLER(20)
+# 添加按键状态标志和防重复发送计时器
+key_state = 0
+last_send_time = 0
+#TOF
+tof = DL1X()
+
+
+
+
+# 中断标志位
+ticker_flag = False
+ticker_count = 0
+ticker_flag1 = False
+ticker_count1 = 0
+ticker_flag2 = False
+ticker_count2 = 0
+ticker_flag3 = False
+ticker_count3 = 0
+
+
+
+
+
+pingmu_flag = 0
+
+#类1--------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+class PID:
+    def __init__(self, kp, ki, kd, imax, target):#初始化
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.imax = abs(imax)  # 绝对值保证积分限幅有效性
+        self.integrator = 0.0
+        self.last_error = 0.0
+        self.out_p = 0.0
+        self.out_i = 0.0
+        self.out_d = 0.0
+        self.out = 0.0
+        self.target = target
+
+    def constrain(self, value, min_val, max_val):
+        if value > max_val:
+            return max_val
+        elif value < min_val:
+            return min_val
+        return value
+
+    def compute(self, error):
+
+        # 累积误差
+        self.integrator += error
+
+        # 积分限幅
+        if abs(self.integrator) > 10:
+            self.integrator = self.constrain(self.integrator, -self.imax, self.imax)
+
+        # 计算各个控制项
+        self.out_p = self.kp * error
+        self.out_i = self.ki * self.integrator
+        self.out_d = self.kd * (error - self.last_error)
+
+        # 更新最后一次误差
+        self.last_error = error
+
+        # 总输出
+        self.out = self.out_p + self.out_i + self.out_d
+
+        return self.out
+pid = PID(0, 0, 0, 0.0, -0.0)
+#类2--------------------------------------------------------------------------------------------------------------------------------
+class SensorData:
+    def __init__(self):
+        # IMU Data
+        self.imu_raw = [0]*9
+        self.filtered_angle = 0.0
+        self.gyro = [0.0]*3
+        
+        # Encoder
+        self.enc3 = 0
+        self.enc4 = 0
+        self.last_enc3 = 0
+        self.last_enc4 = 0
+        
+        # CCD
+        self.ccd3 = [0]*128
+        self.ccd4 = [0]*128
+        self.ccd_updated = False
+        
+        # # PID Parameters                                    静止下：(换完963)
+        # self.speed_pid = PID(2, 0.08, 0.2, 50.0, -0.0)            #(2.5  0.1  0.5)
+        # # self.speed_pid = PID(2, 0.00, 0.0, 50.0, -300.0)            #(2.5  0.1  0.5)
+     
+        # self.angle_pid = PID(13, 0, 2, 0.0, 0.0)             #(2  0.6)pd
+        # self.gyro_pid = PID(0.9, 0.06, 0.1, 6000.0, 0.0)         #(1.2  0.2)pd
+        
+
+
+
+                # PID Parameters                                    静止下：(换完963)
+        self.speed_pid = PID(2.2, 0.03, 0.0, 50.0, -0.0)            #(2.9  0.03  0.0)
+        # self.speed_pid = PID(2, 0.00, 0.0, 50.0, -300.0)            #(2.5  0.1  0.5)
+     
+        self.angle_pid = PID(5, 0.02, 0.04, 0.0, 0.0)             #(2  0.6)pd
+        self.gyro_pid = PID(1.5, 0.0, 0.1, 6000.0, 0.0)         #(1.2  0.2)pd         1.5  0.1
+
+
+        # 速度环Control Parameters
+        self.speed_error = 0
+        self.speed_error_last = 0
+        
+        # 方向环Control Parameters
+        self.direction_kp = 45
+        self.direction_kp2 = 0.8
+        self.direction_kd = 0.2
+        self.direction_kd2 = 0.6  #0.7
+        self.direction_error3 = 0
+        self.direction_error4 = 0
+        self.direction_error3_last = 0
+        self.direction_error4_last = 0
+        self.direction_out3 = 0.0
+        self.direction_out4 = 0.0
+        self.direction_out = 0.0
+        
+sensor_data = SensorData()
+
+#类3--------------------------------------------------------------------------------------------------------------------------------
+class Init_Yuansu:
+    def __init__(self):
+        self.flag = 0
+        self.counter = 0
+
+init_yuansu = Init_Yuansu()
+
+#类4--------------------------------------------------------------------------------------------------------------------------------
+class KeyFlags:
+    def __init__(self):
+        # 短按标志 [key0, key1, key2, key3]
+        self.short_press = [0] * 4  
+        # 长按标志 [key0, key1, key2, key3]
+        self.long_press = [0] * 4
+
+key_flags = KeyFlags()
+
+class ART:
+    def __init__(self):
+        self.flag = 0
+        self.buf = 0
+        self.buf3 = 0
+
+    def update(self, data):
+        self.buf = (self.buf << 1) | data
+        if self.buf == 0b10101010101010101010101010101010:
+            self.flag = 1
+
+art = ART()
+#类4--------------------------------------------------------------------------------------------------------------------------------
+class ListDeque:
+    def __init__(self, max_len=5):
+        self.buffer = []
+        self.max_len = max_len
+        
+    def append(self, item):
+        if len(self.buffer) >= self.max_len:
+            self.buffer.pop(0)
+        self.buffer.append(item)
+    
+    def __getitem__(self, index):
+        return self.buffer[index]
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+    def latest(self):
+        return self.buffer[-1] if self.buffer else None
+        
+    # 新增求和方法
+    def sum(self):
+        return sum(self.buffer)
+#类5--------------------------------------------------------------------------------------------------------------------------------
+class SensorFilter:
+    def __init__(self, ratio_gyro=4.2, ratio_acc=2.8, dt=0.005):
+        """
+        传感器滤波与融合类
+        :param ratio_gyro: 陀螺仪比例系数
+        :param ratio_acc: 加速度计比例系数 
+        :param dt: 采样周期
+        """
+        self.ratio_gyro = ratio_gyro
+        self.ratio_acc = ratio_acc
+        self.dt = dt
+        self._first_angle = True
+        self._last_angle = 0.0
+
+    def iir_lpf(self, raw_value, filtered_value, factor):
+        """IIR低通滤波器"""
+        return filtered_value + factor * (raw_value - filtered_value)
+
+    def complementary_filter(self, acc_angle, gyro_rate):
+        """
+        互补滤波角度计算
+        :param acc_angle: 加速度计角度（度）
+        :param gyro_rate: 陀螺仪角速度（度/秒）
+        :return: 融合后的角度（度）
+        """
+        if self._first_angle:
+            if acc_angle is not None:
+                self._last_angle = acc_angle
+                self._first_angle = False
+            return acc_angle or 0.0
+
+        gyro_input = gyro_rate * self.ratio_gyro
+        acc_error = (acc_angle - self._last_angle) * self.ratio_acc if acc_angle else 0
+        fused_angle = self._last_angle + (acc_error + gyro_input) * self.dt
+        self._last_angle = fused_angle
+        return fused_angle
+
+    def reset(self):
+        """重置滤波器状态"""
+        self._first_angle = True
+        self._last_angle = 0.0
+        
+filter_module = SensorFilter(ratio_gyro=4.2, ratio_acc=2.8)
+#类6--------------------------------------------------------------------------------------------------------------------------------
+class VisionProcessor:
+    def __init__(self):
+
+        self.tof_data = 600
+
+        # CCD阈值
+        self.CCD_threshold = 0.4
+
+        self.left_annual_flag = 0
+        self.right_annual_flag = 0
+
+        self.left_annual_yuzhi = 220
+        self.right_annual_yuzhi = 220
+        
+        self.right_counter1 = 0
+        self.right_counter2 = 0 
+        self.right_counter3 = 0
+        self.right_counter6 = 0
+
+        self.left_counter1 = 0
+        self.left_counter2 = 0
+        self.left_counter3 = 0
+        self.left_counter6 = 0
+
+        #十字路口标志位
+        self.cross_flag = 0
+        self.cross_counter = 0   # 连续检测计数器
+
+        #CCD3 CCD4左右边界
+        self.left3_edge = 0
+        self.left4_edge = 0
+        self.right3_edge = 127
+        self.right4_edge = 127
+
+        #当前赛宽
+        #CCD3
+        self.current_track_width3 = 80
+        self.current_left_track_width3 = 40
+        self.current_right_track_width3 = 40
+        #CCD4
+        self.current_track_width4 = 70
+        self.current_left_track_width4 = 35 
+        self.current_right_track_width4 = 35
+        
+        #误差
+        self.error3 = 0.0
+        self.error4 = 0.0
+        self.last_valid_error3 = 0
+        self.last_valid_error4 = 0  
+        
+        # 新增历史数据相关初始化（需要放在其他参数之后）   环形缓冲区
+        self.history_size = 5  # 历史数据帧数
+
+        # CCD3 缓冲区
+        self.width3_history = ListDeque(self.history_size)
+        self.left3_edge_history = ListDeque(self.history_size)
+        self.right3_edge_history = ListDeque(self.history_size)
+        # CCD4 缓冲区 
+        self.width4_history = ListDeque(self.history_size)
+        self.left4_edge_history = ListDeque(self.history_size)
+        self.right4_edge_history = ListDeque(self.history_size)
+
+        #可以不用，初始化是空的让它自己满满填充
+        # 填充初始值（保持原有逻辑）
+        for _ in range(self.history_size):
+            self.width3_history.append(self.current_track_width3)
+            self.left3_edge_history.append(self.left3_edge)
+            self.right3_edge_history.append(self.right3_edge)
+            
+            self.width4_history.append(self.current_track_width4)
+            self.left4_edge_history.append(self.left4_edge)
+            self.right4_edge_history.append(self.right4_edge)
+      
+
+        # 蜂鸣器触发时间戳
+        self.beep_start_time = None  
+       
+        # 丢线标志
+        self.lost_line3 = False
+        self.lost_line4 = False
+
+        #陀螺仪积分圆环
+        self.gyro_integral = 0
+        self.gyro_integral_last = 0
+
+        # 添加统一超时计数器
+        self.left_timeout_counter = 0
+        self.right_timeout_counter = 0
+
+        self.left_yanshi_flag = 0
+
+
+        # 新增衰减补偿参数    边缘像素提亮
+        self.center_gain = 1.0    # 中心区域增益
+        self.edge_gain = 1.5      # 边缘区域增益
+        self.transition_width = 30 # 过渡区域宽度
+        
+        # 预计算增益曲线（128像素CCD）
+        self.gain_table = []
+        for i in range(128):
+            # 使用二次曲线补偿（可根据实际衰减曲线调整）
+            distance_from_center = abs(i - 64)
+            if distance_from_center > 64 - self.transition_width:
+                gain = 1.0 + (self.edge_gain - 1.0) * ((distance_from_center - (64 - self.transition_width)) / (64 - self.transition_width))**2
+            else:
+                gain = self.center_gain
+            self.gain_table.append(gain)
+
+
+        # 新增斑马线检测参数
+        self.crosswalk_threshold = 5    # 有效边缘对数阈值（12次跳变对应5条白线）
+        self.crosswalk_counter = 0      # 连续满足条件的帧数
+        self.crosswalk_flag = 0        # 斑马线状态标志
+        self.edge_count3 = 0           # CCD3边缘跳变次数
+        self.edge_count4 = 0           # CCD4边缘跳变次数
+        self.crosswalk_enter_time = None  # 斑马线进入时间戳
+    def calculate_error_diff_over_sum3_4(self, ccd_data3, ccd_data4, threshold_ratio=0.8):
+        # 应用光学衰减补偿
+        ccd_data3 = [min(int(val * self.gain_table[i]), 4095) for i, val in enumerate(ccd_data3)]
+        ccd_data4 = [min(int(val * self.gain_table[i]), 4095) for i, val in enumerate(ccd_data4)]
+        # 动态阈值计算
+        avg3 = sum(ccd_data3[30:100]) / 70
+        avg4 = sum(ccd_data4[30:100]) / 70
+        threshold3 = avg3 * threshold_ratio
+        threshold4 = avg4 * threshold_ratio
+
+        
+        # 丢线标志
+        self.lost_line3 = False
+        self.lost_line4 = False
+
+        # 检测是否全白/全黑
+        white_count3 = sum(1 for x in ccd_data3 if x > threshold3)
+        white_count4 = sum(1 for x in ccd_data4 if x > threshold4)
+        
+        #############################CCD3####################################
+
+        # 寻找左边缘 - CCD3
+        for i in range(64, 0, -1):
+            if ccd_data3[i] > threshold3 and ccd_data3[i-1] < threshold3:
+                self.left3_edge = i
+                break
+            elif i == 1:
+                self.left3_edge = 0
+                
+        # 寻找右边缘 - CCD3
+        for i in range(64, 127):
+            if ccd_data3[i] > threshold3 and ccd_data3[i+1] < threshold3:
+                self.right3_edge = i
+                break 
+            elif i == 126:
+                self.right3_edge = 127
+        # 计算中线偏差
+        center3 = (self.left3_edge + self.right3_edge) / 2
+        self.error3 = 64 - center3 
+
+        #############################CCD4####################################
+        # 寻找左边缘 - CCD4
+        for i in range(64, 0, -1):
+            if ccd_data4[i] > threshold4 and ccd_data4[i-1] < threshold4:
+                self.left4_edge = i
+                break
+            elif i == 1:
+                self.left4_edge = 0
+                
+        # 寻找右边缘 - CCD4
+        for i in range(64, 127):
+            if ccd_data4[i] > threshold4 and ccd_data4[i+1] < threshold4:
+                self.right4_edge = i
+                break
+            elif i == 126:
+                self.right4_edge = 127
+
+        # 计算中线偏差
+        center4 = (self.left4_edge + self.right4_edge) / 2
+        self.error4 = 64 - center4
+
+        # 全黑或全白的处理
+        if white_count3 < 10 or white_count3 > 115:  # 几乎全黑或全白
+            self.error3 = self.last_valid_error3  # 使用上次的有效值
+            self.lost_line3 = True
+        if white_count4 < 10 or white_count4 > 115:  # 几乎全黑或全白
+            self.error4 = self.last_valid_error4  # 使用上次的有效值
+            self.lost_line4 = True
+
+
+
+        # 更新历史数据
+        self.last_valid_error3 = self.error3  # 更新最后有效值
+        self.last_valid_error4 = self.error4  # 更新最后有效值
+        
+        # 当前全赛道宽度
+        self.current_track_width3 = self.right3_edge - self.left3_edge
+        self.current_track_width4 = self.right4_edge - self.left4_edge
+
+        # 当前左右车道宽度
+        self.current_left_track_width3 = 64 - self.left3_edge   #左3
+        self.current_right_track_width3 = self.right3_edge - 64  #右3
+        self.current_left_track_width4 = 64 - self.left4_edge    #左4
+        self.current_right_track_width4 = self.right4_edge - 64  #右4
+    
+        
+        # CCD3 相关缓冲区更新
+        self.width3_history.append(self.current_track_width3)
+        self.left3_edge_history.append(self.left3_edge)
+        self.right3_edge_history.append(self.right3_edge)
+        
+        # CCD4 相关缓冲区更新
+        self.width4_history.append(self.current_track_width4)
+        self.left4_edge_history.append(self.left4_edge)
+        self.right4_edge_history.append(self.right4_edge)
+    
+        # 特殊情况处理
+        if self.lost_line3 and self.lost_line4:
+            # 两个传感器都丢线，可能是十字路口或特殊区域
+            # 使用上一次的有效值，但可以适当增加权重
+            self.error3 = self.last_valid_error3 * 1.2
+            self.error4 = self.last_valid_error4 * 1.2
+        elif self.lost_line3:
+            # 只有CCD3丢线，多依赖CCD4的数据
+            self.error3 = self.error4 * 1.1
+        elif self.lost_line4:
+            # 只有CCD4丢线，多依赖CCD3的数据
+            self.error4 = self.error3 * 1.1
+
+        if(self.current_track_width3 > 65 or self.current_track_width4 > 65):
+            iir_lpf = 0.2
+        else:
+            iir_lpf = 0.3
+
+        # 添加简单的滤波
+        self.error3 = filter_module.iir_lpf(self.error3, self.last_valid_error3, iir_lpf)
+        self.error4 = filter_module.iir_lpf(self.error4, self.last_valid_error4, iir_lpf)
+
+        if(init_yuansu.flag == 0):
+            init_yuansu.counter += 1
+            if init_yuansu.counter % 20 == 0:  # 每100次打印一次，避免打印太频繁
+                print("Counter:", init_yuansu.counter)
+            if(init_yuansu.counter > 200):
+                print("Switching to main loop")
+                init_yuansu.flag = 1
+                init_yuansu.counter = 0
+        if(init_yuansu.flag == 1):
+            self.right_anulusdetect()
+            self.left_anulusdetect()
+            
+            # self._count_edges(ccd_data3, ccd_data4, threshold3, 200)# 斑马线边缘计数（在原有左右边缘检测循环中添加）
+            # self.crosswalk_detect()
+            # self.cross()
+            self.control()
+        if self.left_timeout_counter > 250:
+            # self.left_annual_flag = 0  # 复位状态
+            self.left_timeout_counter = 0
+        if self.right_timeout_counter > 250:
+            # self.right_annual_flag = 0
+            self.right_timeout_counter = 0
+
+        # 归一化处理
+        max_error = 64  # 最大可能偏差
+        error3_normalized = (self.error3 / max_error) * 100
+        error4_normalized = (self.error4 / max_error) * 100
+
+        # 限幅处理
+        error3_normalized = max(min(error3_normalized, 100), -100)
+        error4_normalized = max(min(error4_normalized, 100), -100)
+
+        return error3_normalized, error4_normalized
+    
+
+
+ 
+
+    def left_anulusdetect(self):
+        if art.buf == 1 and self.left_annual_flag == 0:
+            self.left_annual_flag = 1
+            beep.high()
+            self.beep_start_time = time.ticks_ms()  # 记录蜂鸣器开始时间
+
+        # elif self.left_annual_flag == 1:
+        #     if(self.left3_edge_history[-1] - self.left3_edge_history[-2] < -25) or (self.left4_edge_history[-1] - self.left4_edge_history[-2] < -20):
+        #         self.left_annual_flag = 2
+
+        elif self.left_annual_flag == 1:
+            if(self.left3_edge < 15):
+                self.left_counter1 += 1
+                if self.left_counter1 >= 3:
+                    self.left_annual_flag = 2
+            else:
+                self.left_counter1 = 0
+
+        elif self.left_annual_flag == 2:
+            if(self.left3_edge > 38):
+                self.left_counter2 += 1
+                if self.left_counter2 >= 3:
+                    self.left_annual_flag = 3
+            else:
+                self.left_counter2 = 0
+
+        elif self.left_annual_flag == 3:
+            if(self.left3_edge < 20):
+                self.left_counter3 += 1
+                if self.left_counter3 >= 3:
+                    self.left_annual_flag = 4
+            else:
+                self.left_counter3 = 0
+
+        elif self.left_annual_flag == 6:
+            self.left_counter6 += 1
+            if self.left_counter6 >= 80:
+                self.left_annual_flag = 0
+                self.left_counter6 = 0
+                beep.high()
+                self.beep_start_time = time.ticks_ms()  # 记录蜂鸣器开始时间
+
+
+
+    def right_anulusdetect(self):
+        if art.buf == 2 and self.right_annual_flag == 0:
+            self.right_annual_flag = 1
+            beep.high()
+            self.beep_start_time = time.ticks_ms()
+
+        # elif self.right_annual_flag == 1:
+        #     if(self.right3_edge_history[-1] - self.right3_edge_history[-2] > 25) or (self.right4_edge_history[-1] - self.right4_edge_history[-2] > 20):
+        #         self.right_annual_flag = 2
+
+        elif self.right_annual_flag == 1:
+            if(self.right3_edge > 120):
+                self.right_counter1 += 1  # 改为实例变量
+                if self.right_counter1 >= 3:
+                    self.right_annual_flag = 2
+            else:
+                self.right_counter1 = 0
+
+        elif self.right_annual_flag == 2:
+            if(self.right3_edge < 100):
+                self.right_counter2 += 1  # 改为实例变量
+                if self.right_counter2 >= 3:
+                    self.right_annual_flag = 3
+            else:
+                self.right_counter2 = 0
+
+        elif self.right_annual_flag == 3:
+            if(self.right3_edge > 120):
+                self.right_counter3 += 1  # 改为实例变量
+                if self.right_counter3 >= 3:
+                    self.right_annual_flag = 4
+            else:
+                self.right_counter3 = 0
+
+        elif self.right_annual_flag == 6:
+            self.right_counter6 += 1  # 改为实例变量
+            if self.right_counter6 >= 80:
+                self.right_annual_flag = 0
+                self.right_counter6 = 0
+                beep.high()
+                self.beep_start_time = time.ticks_ms()
+
+        
+
+
+#十字延时还没做
+    def cross(self):
+        if self.cross_flag == 0 and self.current_track_width3 > 120 and self.left_annual_flag != 7 and self.right_annual_flag != 7:
+            self.cross_flag = 1
+    #斑马线
+    def _count_edges(self, ccd3, ccd4, th3, th4):
+        """辅助方法：统计CCD数据的边缘跳变次数"""
+        # CCD3边缘计数（前瞻CCD）
+        self.edge_count3 = 0
+        edge_state3 = ccd3[0] > th3  # 使用独立的状态变量
+        for i, val in enumerate(ccd3):
+            new_state3 = val > th3
+            if new_state3 != edge_state3:
+                self.edge_count3 += 1
+                edge_state3 = new_state3
+                # 调试时可取消注释
+                # if i > 0 and i < 127: 
+                #     print(f"C3 edge at {i}")
+
+        # CCD4边缘计数（近端CCD）
+        self.edge_count4 = 0
+        edge_state4 = ccd4[0] > th4  # 独立的初始状态
+        for i, val in enumerate(ccd4):
+            new_state4 = val > th4
+            if new_state4 != edge_state4:
+                self.edge_count4 += 1
+                edge_state4 = new_state4   
+
+    def crosswalk_detect(self):
+        """改进版斑马线检测（分阶段识别）"""
+        # 阶段0：远端CCD3检测特征（前瞻识别）
+        # if self.crosswalk_flag == 0:
+        #     valid_edges3 = (self.edge_count3 // 2) >= self.crosswalk_threshold
+        #     if valid_edges3 and self.current_track_width3 < 50:  # 增加赛道宽度条件
+        #         self.crosswalk_counter += 1
+        #         if self.crosswalk_counter >= 2:  # 连续3帧满足
+        #             self.crosswalk_flag = 1
+
+        
+        # 阶段1：近端CCD4确认特征（近距离验证）
+        if self.crosswalk_flag == 0:
+            valid_edges4 = (self.edge_count4 // 2) >= (self.crosswalk_threshold - 1)  # 阈值略降
+            if valid_edges4 and self.current_track_width4 < 40:
+                self.crosswalk_counter += 1
+                if self.crosswalk_counter >= 2:  # 需要更严格的确认
+                    self.crosswalk_flag = 2
+                    self.crosswalk_enter_time = time.ticks_ms() # 记录进入时间
+            else:
+                self.crosswalk_counter = max(self.crosswalk_counter - 1, 0)
+        elif self.crosswalk_flag == 2 and time.ticks_diff(time.ticks_ms(), self.crosswalk_enter_time) > 500:
+            self.crosswalk_flag = 3  # 停车
+            motion_module.end_flag = 1
+            
+            
+    def control(self):
+        # 左圆环控制
+        if(self.left_annual_flag == 1):
+            self.error3 = (90 - self.right3_edge) * 1
+            self.error4 = (100 - self.right4_edge) * 1
+        elif(self.left_annual_flag == 2):
+            self.error3 = (90 - self.right3_edge) * 1
+            self.error4 = (100 - self.right4_edge) * 1
+        elif(self.left_annual_flag == 3):
+            self.error3 = (90 - self.right3_edge) * 1
+            self.error4 = (100 - self.right4_edge) * 1
+        elif(self.left_annual_flag == 4 or self.left_annual_flag == 5):
+            self.error3 = (40 - self.left3_edge) * 1
+            self.error4 = (25 - self.left4_edge) * 1                     
+        elif(self.left_annual_flag == 6):
+            self.error3 = (90 - self.right3_edge) * 1
+            self.error4 = (100 - self.right4_edge) * 1
+
+            # left_yanshi_flag += 1
+            # if left_yanshi_flag > 250:
+            #     self.left_annual_flag = 0
+            #     left_yanshi_flag = 0
+
+        if(self.right_annual_flag == 1):
+            self.error3 = (40 - self.left4_edge) * 1
+            self.error4 = (25 - self.left4_edge) * 1
+        elif(self.right_annual_flag == 2):
+            self.error3 = (40 - self.left4_edge) * 1
+            self.error4 = (25 - self.left4_edge) * 1
+        elif(self.right_annual_flag == 3):
+            self.error3 = (40 - self.left4_edge) * 1
+            self.error4 = (25 - self.left4_edge) * 1
+        elif(self.right_annual_flag == 4 or self.right_annual_flag == 5):
+            self.error3 = (90 - self.right4_edge) * 1
+            self.error4 = (100 - self.right4_edge) * 1
+        elif(self.right_annual_flag == 6):
+            self.error3 = (40 - self.left4_edge) * 1
+            self.error4 = (25 - self.left4_edge) * 1
+        
+        #十字控制
+        elif(self.cross_flag == 1):
+            self.error3 = 0
+            self.error4 = 0
+
+        #斑马线控制
+        elif(self.crosswalk_flag == 3):
+            sensor_data.speed_pid.target = 0
+
+
+vision_module = VisionProcessor()
+
+#类7--------------------------------------------------------------------------------------------------------------------------------        
+class MotionController:
+    def __init__(self):
+        self._speed_out_prev = 0
+        self.start_flag = 0
+        self.end_flag = 0
+        self.smooth_speed = 0
+        self.speed_target = -400
+    def speed_smoothing(self, target_speed):
+
+        # 设置较小的加速度限制
+        max_acceleration = 0.2  # 可以根据实际需求调整这个值
+        
+        # 计算期望变化量
+        delta = target_speed - self._speed_out_prev
+
+        # 限制速度变化量
+        if abs(delta) > max_acceleration:
+            if delta > 0:
+                smoothed_speed = self._speed_out_prev + max_acceleration
+            else:
+                smoothed_speed = self._speed_out_prev - max_acceleration
+        else:
+            smoothed_speed = target_speed
+
+        self._speed_out_prev = smoothed_speed
+        
+        return smoothed_speed
+    
+
+motion_module = MotionController()
+
+#----------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+class Menu:
+    def __init__(self):
+        self.menu_index = 0
+        # 修改参数列表为动态获取模式
+        self.params = [
+            {"name": "speed.kp", "get": lambda: sensor_data.speed_pid.kp, "set": lambda v: setattr(sensor_data.speed_pid, 'kp', v), "step": 0.1},
+            {"name": "speed.ki", "get": lambda: sensor_data.speed_pid.ki, "set": lambda v: setattr(sensor_data.speed_pid, 'ki', v), "step": 0.01},
+            {"name": "speed.kd", "get": lambda: sensor_data.speed_pid.kd, "set": lambda v: setattr(sensor_data.speed_pid, 'kd', v), "step": 0.1},
+            {"name": "direction.kp", "get": lambda: sensor_data.direction_kp, "set": lambda v: setattr(sensor_data, 'direction_kp', v), "step": 1},
+            {"name": "direction.kp2", "get": lambda: sensor_data.direction_kp2, "set": lambda v: setattr(sensor_data, 'direction_kp2', v), "step": 0.1},
+            {"name": "direction.kd", "get": lambda: sensor_data.direction_kd, "set": lambda v: setattr(sensor_data, 'direction_kd', v), "step": 0.1},
+            {"name": "direction.kd2", "get": lambda: sensor_data.direction_kd2, "set": lambda v: setattr(sensor_data, 'direction_kd2', v), "step": 0.1},
+            {"name": "angle.kp", "get": lambda: sensor_data.angle_pid.kp, "set": lambda v: setattr(sensor_data.angle_pid, 'kp', v), "step": 0.1},
+            {"name": "angle.ki", "get": lambda: sensor_data.angle_pid.ki, "set": lambda v: setattr(sensor_data.angle_pid, 'ki', v), "step": 0.01},
+            {"name": "angle.kd", "get": lambda: sensor_data.angle_pid.kd, "set": lambda v: setattr(sensor_data.angle_pid, 'kd', v), "step": 0.1},
+            {"name": "gyro.kp", "get": lambda: sensor_data.gyro_pid.kp, "set": lambda v: setattr(sensor_data.gyro_pid, 'kp', v), "step": 0.1},
+            {"name": "gyro.ki", "get": lambda: sensor_data.gyro_pid.ki, "set": lambda v: setattr(sensor_data.gyro_pid, 'ki', v), "step": 0.01},
+            {"name": "gyro.kd", "get": lambda: sensor_data.gyro_pid.kd, "set": lambda v: setattr(sensor_data.gyro_pid, 'kd', v), "step": 0.1},
+            {"name": "target_speed", "get": lambda: motion_module.speed_target, "set": lambda v: setattr(motion_module, 'speed_target', v), "step": 10},
+            {"name": "left_annual_yuzhi", "get": lambda: vision_module.left_annual_yuzhi, "set": lambda v: setattr(vision_module, 'left_annual_yuzhi', v), "step": 10},
+            {"name": "right_annual_yuzhi", "get": lambda: vision_module.right_annual_yuzhi, "set": lambda v: setattr(vision_module, 'right_annual_yuzhi', v), "step": 10},
+            {"name": "CCD_threshold", "get": lambda: vision_module.CCD_threshold, "set": lambda v: setattr(vision_module, 'CCD_threshold', v), "step": 0.05},
+        ]
+
+    def highlight(self):
+        for i, param in enumerate(self.params):
+            color = 0x07E0 if i == self.menu_index else 0xFFFF
+            # 动态获取当前值
+            current_value = param["get"]()
+            lcd.str12(0, 28 + i * 14, f"{param['name']}: {current_value:.4f}", color)
+
+    def handle_input(self):
+        global key_data
+        if key_data[1] == 1:  # 增加按键去抖动处理
+            self.menu_index = (self.menu_index + 1) % len(self.params)
+            print("menu_index:", self.menu_index)
+            time.sleep_ms(100)  # 延长延时确保按键触发
+            
+        elif key_data[2] == 1 or key_data[3] == 1:
+            print("menu_index:", self.menu_index)
+            current_param = self.params[self.menu_index]
+            # 获取当前值并修改
+            current_value = current_param["get"]()
+            step = current_param["step"] * (-1 if key_data[3] == 1 else 1)
+            new_value = current_value + step
+            current_param["set"](new_value)  # 直接设置新值
+            time.sleep_ms(50)
+
+# 初始化菜单
+menu = Menu()
+
+
+#类8--------------------------------------------------------------------------------------------------------------------------------
+class Test:
+    def __init__(self):
+        self.t1 = 0
+        self.t2 = 0
+        self.menu_flag = 0
+
+test = Test()
+#静止：0.01， 0， 0.8， 0.03， 0.56， 0.07    或者5， 0， 0.6， 0.01， 1， 0.25
+
+#函数----------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+
+##------------------------------------------------------函数----------------------------------------------------------------------------
+def display():
+    global pingmu_flag
+    if(pingmu_flag % 4 == 0 and state3 == 0):
+        lcd.clear(0x0000)
+        wireless.send_oscilloscope(sensor_data.filtered_angle,
+                            vision_module.right3_edge,sensor_data.angle_pid.kd,
+                            sensor_data.gyro_pid.kp,sensor_data.gyro_pid.ki,
+                            sensor_data.direction_kp ,
+                            sensor_data.direction_kd,sensor_data.direction_out)
+        # data_flag = wireless.data_analysis()
+        #     # sensor_data.speed_pid.kp = wireless.get_data(0)
+            # sensor_data.angle_pid.kp = wireless.get_data(1)
+            # sensor_data.angle_pid.kd = wireless.get_data(2)
+            # sensor_data.gyro_pid.kp = wireless.get_data(3)
+            # sensor_data.gyro_pid.ki = wireless.get_data(4)
+            # sensor_data.direction_kp = wireless.get_data(5)
+            # sensor_data.direction_kp2 = wireless.get_data(6)
+            # sensor_data.direction_kd2 = wireless.get_data(7)
+
+    if(pingmu_flag % 4 == 1 and state3 == 0):
+        lcd.clear(0x0000)
+        lcd.str12(0,  14, "changliang",0xFFFF)
+        lcd.str12(0,  28, "sensor_data.filtered_angle: {:.1f}".format(sensor_data.filtered_angle),0xFFFF)
+        lcd.str12(0,  42, "error3 = {:>.1f},  error4 = {:>.1f}".format(sensor_data.direction_error3,sensor_data.direction_error4),0xFFFF)
+        lcd.str12(0,  56, "left3edge:{:>.d}, right3edge:{:>.d}".format(vision_module.left3_edge,vision_module.right3_edge),0xFFFF)
+        lcd.str12(0,  70, "left4edge:{:>.d}, right4edge:{:>.d}".format(vision_module.left4_edge,vision_module.right4_edge),0xFFFF)
+        lcd.str12(0,  84, "width3 = {:>.d}, left3 = {:>.d}, right3 = {:>.d}".format(vision_module.current_track_width3,vision_module.current_left_track_width3,vision_module.current_right_track_width3),0xFFFF)
+        lcd.str12(0,  98, "width4 = {:>.d}, left4 = {:>.d}, right4 = {:>.d}".format(vision_module.current_track_width4,vision_module.current_left_track_width4,vision_module.current_right_track_width4),0xFFFF)
+        lcd.str12(0,  112, "left_flag : {:>.d},right_flag : {:>.d},zebra:{:>.d}".format(vision_module.left_annual_flag,vision_module.right_annual_flag,vision_module.crosswalk_flag),0xFFFF)
+        lcd.str12(0,  126, "start_flag : {:>.d},end_flag : {:>.d}".format(motion_module.start_flag,motion_module.end_flag),0xFFFF) 
+        lcd.str12(0,  140, "art_buf :{:>.d},art_flag :{:>.d}".format(art.buf,art.flag),0xFFFF)
+        lcd.str12(0,  154, "vision_module.tof_data :{:>.d}".format(vision_module.tof_data ),0xFFFF)
+    if(pingmu_flag % 4 == 2 and state3 == 0):
+        lcd.clear(0x0000)
+        lcd.str12(0,  28, "speed.kp = {:>.3f}".format(sensor_data.speed_pid.kp),0xFFFF)
+        lcd.str12(0,  42, "speed.ki = {:>.3f}".format(sensor_data.speed_pid.ki),0xFFFF)
+        lcd.str12(0,  56, "speed.kd = {:>.3f}".format(sensor_data.speed_pid.kd),0xFFFF)
+        lcd.str12(0,  70, "direction.kp = {:>.3f}".format(sensor_data.direction_kp),0xFFFF)
+        lcd.str12(0,  84, "direction.kp2 = {:>.3f}".format(sensor_data.direction_kp2),0xFFFF)
+        lcd.str12(0,  98, "direction.kd = {:>.3f}".format(sensor_data.direction_kd),0xFFFF)
+        lcd.str12(0,  112, "direction.kd2 = {:>.3f}".format(sensor_data.direction_kd2),0xFFFF)
+        lcd.str12(0,  126, "angle.kp = {:>.3f}".format(sensor_data.angle_pid.kp),0xFFFF)
+        lcd.str12(0,  140, "angle.ki = {:>.3f}".format(sensor_data.angle_pid.ki),0xFFFF)
+        lcd.str12(0,  154, "angle.kd = {:>.3f}".format(sensor_data.angle_pid.kd),0xFFFF)
+        lcd.str12(0,  168, "gyro.kp = {:>.3f}".format(sensor_data.gyro_pid.kp),0xFFFF)
+        lcd.str12(0,  182, "gyro.ki = {:>.3f}".format(sensor_data.gyro_pid.ki),0xFFFF)
+        lcd.str12(0,  196, "gyro.kd = {:>.3f}".format(sensor_data.gyro_pid.kd),0xFFFF)
+        lcd.str12(0,  210, "target_speed = {:>.1f}".format(motion_module.speed_target),0xFFFF)     
+        lcd.str12(0,  224, "left_annual_yuzhi = {:>.1f}".format(vision_module.left_annual_yuzhi),0xFFFF)
+        lcd.str12(0,  238, "right_annual_yuzhi = {:>.1f}".format(vision_module.right_annual_yuzhi),0xFFFF)
+        lcd.str12(0,  252, "CCD_threshold = {:>.1f}".format(vision_module.CCD_threshold),0xFFFF)
+        menu.highlight()  # 显示菜单
+
+    if(pingmu_flag % 4 == 3 and state3 == 0):
+        lcd.clear(0x0000)
+        lcd.wave(0,128, 128, 64, sensor_data.ccd3, max = 255)
+        lcd.wave(0,192, 128, 64, sensor_data.ccd4, max = 255)
+
+
+# 定义一个回调函数 需要一个参数 这个参数就是 ticker 实例自身
+def time_pit_handler0(time):  
+    global ticker_flag  # 需要注意的是这里得使用 global 修饰全局属性
+    global ticker_count
+    global key_data
+    global sensor_data
+    # 原子操作更新编码器数据
+    ticker_flag = True  # 否则它会新建一个局部变量
+    ticker_count = (ticker_count + 1) if (ticker_count < 1000) else (1)
+    vision_module.tof_data = tof.get()
+    key_data = key.get()
+    sensor_data.enc3 = encoder_3.get()
+    sensor_data.enc4 = encoder_4.get()
+    sensor_data.enc3 = filter_module.iir_lpf(sensor_data.enc3,sensor_data.last_enc3,0.35)
+    sensor_data.enc4 = filter_module.iir_lpf(sensor_data.enc4,sensor_data.last_enc3,0.35)
+    sensor_data.speed_error = (sensor_data.enc3 + sensor_data.enc4) / 2 - sensor_data.speed_pid.target
+    sensor_data.speed_pid.out = sensor_data.speed_pid.compute(sensor_data.speed_error * 0.8 + sensor_data.speed_error_last * 0.2)  #一阶低通滤波
+    sensor_data.speed_pid.out = sensor_data.speed_pid.constrain(sensor_data.speed_pid.out,-1000,1000)
+    sensor_data.speed_error_last = sensor_data.speed_error
+    sensor_data.last_enc3 = sensor_data.enc3
+    sensor_data.last_enc4 = sensor_data.enc4
+
+
+    
+def time_pit_handler1(time):
+    global ticker_flag1  # 需要注意的是这里得使用 global 修饰全局属性
+    global ticker_count1
+    global sensor_data
+    ticker_flag1 = True  # 否则它会新建一个局部变量
+    ticker_count1 = (ticker_count1 + 1) if (ticker_count1 < 100) else (1)
+
+    if vision_module.left_annual_flag == 4:
+        vision_module.gyro_integral = 0
+        vision_module.left_annual_flag = 5
+        vision_module.left_timeout_counter = 0
+        
+    elif vision_module.right_annual_flag == 4:
+        vision_module.gyro_integral = 0
+        vision_module.right_annual_flag = 5
+        vision_module.right_timeout_counter = 0
+
+    elif (vision_module.left_annual_flag == 5):
+        vision_module.gyro_integral += sensor_data.imu_raw[5] / 14.3 * 0.01
+        vision_module.gyro_integral = vision_module.gyro_integral * 0.8 + vision_module.gyro_integral_last * 0.2
+        vision_module.gyro_integral_last = vision_module.gyro_integral
+        vision_module.left_timeout_counter = 0
+
+    elif (vision_module.right_annual_flag == 5):
+        vision_module.gyro_integral += sensor_data.imu_raw[5] / 14.3 * 0.01
+        vision_module.gyro_integral = vision_module.gyro_integral * 0.8 + vision_module.gyro_integral_last * 0.2
+        vision_module.gyro_integral_last = vision_module.gyro_integral
+        vision_module.right_timeout_counter = 0
+   
+
+    if abs(vision_module.gyro_integral) > vision_module.left_annual_yuzhi:  #后期直接14.3*230
+        if vision_module.left_annual_flag == 5: #因为超时这里直接可能会触发
+            # beep.high()
+            # vision_module.beep_start_time = time.ticks_ms()  # 记录蜂鸣器开始时间
+            vision_module.left_annual_flag = 6  # 触发新状态
+
+    if abs(vision_module.gyro_integral) > vision_module.right_annual_yuzhi:  #后期直接14.3*230
+        if vision_module.right_annual_flag == 5:
+            # beep.high()
+            # vision_module.beep_start_time = time.ticks_ms()  # 记录蜂鸣器开始时间
+            vision_module.right_annual_flag = 6
+
+    # 原子操作更新CCD数据
+    sensor_data.ccd3 = ccd.get(2)
+    sensor_data.ccd4 = ccd.get(3)
+    sensor_data.ccd_updated = True
+    sensor_data.direction_out3 = sensor_data.direction_error3 * sensor_data.direction_kp + abs(sensor_data.direction_error3) * sensor_data.direction_error3 * sensor_data.direction_kp2 + (sensor_data.direction_error3 - sensor_data.direction_error3_last) * sensor_data.direction_kd - sensor_data.imu_raw[5] * sensor_data.direction_kd2
+    sensor_data.direction_out4 = sensor_data.direction_error4 * sensor_data.direction_kp + abs(sensor_data.direction_error4) * sensor_data.direction_error4 * sensor_data.direction_kp2 + (sensor_data.direction_error4 - sensor_data.direction_error4_last) * sensor_data.direction_kd - sensor_data.imu_raw[5] * sensor_data.direction_kd2
+    sensor_data.direction_out = sensor_data.direction_out3 * vision_module.CCD_threshold + sensor_data.direction_out4 * (1 - vision_module.CCD_threshold)
+    sensor_data.direction_out = pid.constrain(sensor_data.direction_out,-1500,1500)
+    sensor_data.direction_error3_last = sensor_data.direction_error3
+    sensor_data.direction_error4_last = sensor_data.direction_error4
+
+
+    
+def time_pit_handler2(time):
+
+    global ticker_flag2  # 需要注意的是这里得使用 global 修饰全局属性
+    global ticker_count2
+    global sensor_data
+    ticker_flag2 = True  # 否则它会新建一个局部变量
+    ticker_count2 = (ticker_count2 + 1) if (ticker_count2 < 100) else (1)
+    # 原子操作更新IMU数据   
+    sensor_data.filtered_angle = filter_module.complementary_filter(sensor_data.imu_raw[1], sensor_data.imu_raw[3]) - 1850
+    sensor_data.angle_pid.out = sensor_data.angle_pid.compute(sensor_data.filtered_angle + sensor_data.speed_pid.out)
+    sensor_data.angle_pid.out = sensor_data.angle_pid.constrain(sensor_data.angle_pid.out,-1000,1000)
+#     if (sensor_data.angle_pid.out > 0):
+#         motor_3.duty(sensor_data.angle_pid.out + 100)
+#         motor_4.duty(sensor_data.angle_pid.out + 80)
+#     else:
+#         motor_3.duty(sensor_data.angle_pid.out - 100)
+#         motor_4.duty(sensor_data.angle_pid.out - 80)
+
+
+
+
+def time_pit_handler3(time):
+    global ticker_flag3  # 需要注意的是这里得使用 global 修饰全局属性
+    global ticker_count3
+    global sensor_data
+    ticker_flag3 = True  # 否则它会新建一个局部变量
+    ticker_count3 = (ticker_count3 + 1) if (ticker_count3 < 100) else (1)
+    sensor_data.imu_raw = imu.get()
+
+    #角速度环
+    sensor_data.gyro_pid.out = sensor_data.gyro_pid.compute(sensor_data.imu_raw[3] + sensor_data.angle_pid.out)
+    sensor_data.gyro_pid.out = sensor_data.gyro_pid.constrain(sensor_data.gyro_pid.out,-4000,4000)
+#         if (roll < 15 and roll > -35):
+
+
+    if (motion_module.end_flag == 0):
+        if (sensor_data.gyro_pid.out > 0):
+            motor_3.duty(sensor_data.gyro_pid.out + sensor_data.direction_out + 100)
+            motor_4.duty(sensor_data.gyro_pid.out - sensor_data.direction_out + 80)
+        else:
+            motor_3.duty(sensor_data.gyro_pid.out + sensor_data.direction_out - 100)
+            motor_4.duty(sensor_data.gyro_pid.out - sensor_data.direction_out - 80)
+    if (motion_module.end_flag == 1):
+        motor_3.duty(0)
+        motor_4.duty(0)
+#         else:
+#             motor_3.duty(0)
+#             motor_4.duty(0)
+
+#----------------------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------------------
+    
+# 实例化 PIT ticker 模块 参数为编号 [0-3] 最多四个
+pit0 = ticker(0)
+pit1 = ticker(1)
+pit2 = ticker(2)
+pit3 = ticker(3)
+pit0.capture_list(key, encoder_3, encoder_4,tof)
+pit1.capture_list(ccd)
+# pit2.capture_list()
+pit3.capture_list(imu)
+# 关联 Python 回调函数
+pit0.callback(time_pit_handler0)
+pit1.callback(time_pit_handler1)
+pit2.callback(time_pit_handler2)
+pit3.callback(time_pit_handler3)
+# 启动 ticker 实例 参数是触发周期 单位是毫秒
+pit0.start(35)
+pit1.start(10)
+pit2.start(5)
+pit3.start(1)
+
+while True:
+# 性能测试（调试用）
+#     test.t1 = time.ticks_us()
+#     动态PID调节
+    # if((sensor_data.enc3 + sensor_data.enc4) / 2 < motion_module.speed_target):
+    #     sensor_data.gyro_pid.kp = 0.9 + ((sensor_data.enc3 + sensor_data.enc4) / 2 - motion_module.speed_target) * 0.01
+
+#坡道
+    if (art.buf == 3 and art.buf3 == 0):
+        art.buf3 = 1
+        motion_module.start_flag = 1
+        motion_module._speed_out_prev = -50
+
+    vision_module.left_timeout_counter += 1
+    vision_module.right_timeout_counter += 1
+    if(vision_module.tof_data < 300):
+        motion_module.end_flag = 1
+
+    if vision_module.beep_start_time is not None:  # 当存在有效触发时间戳时
+        if time.ticks_diff(time.ticks_ms(), vision_module.beep_start_time) >= 500:
+        
+            # 时间差计算（自动处理计时器溢出）
+            # 当前时间 >= 触发时间 + 200ms 时成立
+            beep.low()  # 停止蜂鸣（假设低电平触发）
+            vision_module.beep_start_time = None  # 重置计时标志
+    
+    #按键：
+    if state3 == 0:
+        if key_data[0] == 1:           #短按 
+            pingmu_flag += 1
+            print("key1 = {:>6d}.".format(key_data[0]))
+            time.sleep_ms(200)
+        
+        if (pingmu_flag % 5 == 3):
+            menu.handle_input()  # 处理菜单按键输入
+        
+        if (ticker_flag and ticker_count % 10 == 0 and pingmu_flag % 5 != 0):  
+            display()
+        if (ticker_flag and ticker_count % 1 == 0 and pingmu_flag % 5 == 0):          #10ms*2
+            display()
+            ticker_flag = False
+
+    if state3 == 1:
+        if key_data[0] == 1:           #短按
+            motion_module.end_flag = 0
+            motion_module.start_flag = 1
+            sensor_data.speed_pid.target = 0
+            motion_module._speed_out_prev = 0
+            vision_module.left_annual_flag = 0
+            vision_module.right_annual_flag = 0
+
+            print("key4 = {:>6d}.".format(key_data[3]))
+            time.sleep_ms(200)
+
+    if key_data[1] == 2:  # 长按且未发送
+        art.flag = 1
+        uart.write(b'S')
+        
+    if key_data[2] == 2:  # 长按且发送
+        art.flag = 0
+        uart.write(b'E')
+
+            
+#         if(key_flags.short_press[0] == 0):
+#             lcd.str24(0,  0, "1.basic", 0xFFFF)
+#             lcd.str24(0,  28, "2.basic", 0xFFFF)
+#             lcd.str24(0,  56, "3.basic", 0xFFFF)
+#             lcd.str24(0,  84, "4.basic", 0xFFFF)
+#             lcd.str24(0,  112, "5.basic", 0xFFFF)  
+
+
+#                 if(key_flags.short_press[0] == 2):
+#                 if(key_flags.short_press[0] == 3):
+#                 if(key_flags.short_press[0] == 4):
+
+    if sensor_data.ccd_updated:
+        buf_len = uart.any()
+        if buf_len:
+            art.buf = uart.read(buf_len)
+            art.buf = art.buf[0]
+            print("{:>6d}.".format(art.buf))
+        sensor_data.direction_error3,sensor_data.direction_error4 = vision_module.calculate_error_diff_over_sum3_4(sensor_data.ccd3,sensor_data.ccd4)
+        sensor_data.ccd_updated = False  # 重置标志位
+
+    if (motion_module.start_flag == 1):
+        if(sensor_data.speed_pid.target < motion_module.speed_target + 2):
+            motion_module.start_flag = 0
+            
+            beep.high() 
+            vision_module.beep_start_time = time.ticks_ms()
+        sensor_data.speed_pid.target = motion_module.speed_smoothing(motion_module.speed_target)
+        # sensor_data.angle_pid.kp = 
+
+
+
+# 被测代码...
+#     test.t2 = time.ticks_us()
+#     print("耗时:", time.ticks_diff(test.t2,test.t1), "微秒")
+
+
+
+# 2. 弯道减速时：
+# ```python
+# # 检测到弯道，需要减速
+# if abs(error) > 50:
+#     target_speed = 60
+#     smooth_speed = self.speed_smoothing(target_speed, current_speed)
+# ```
+        
+# 3. 直道加速时：
+# ```python
+# # 检测到直道，可以加速
+# if abs(error) < 20:
+#     target_speed = 100
+#     smooth_speed = self.speed_smoothing(target_speed, current_speed)
+# ```
+
+            # beep.high() 
+            # self.beep_start_time = time.ticks_ms()
+
+#--------------------------------------------------------------------------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------------------------------------------------------------------------
+#紧急处理，不用动    
+    # 如果拨码开关打开 对应引脚拉低 就退出循环
+    # 这么做是为了防止写错代码导致异常 有一个退出的手段
+    if switch2.value() != state2:
+        print("Test program stop.")
+        break
+    gc.collect()
+
+#测一下key获取如果放进主循环会不会好一点
+#测一下中断时间
+#key = KEY_HANDLER(20)
+# 添加按键状态标志和防重复发送计时器
+# key_state = 0
+# last_send_time = 0 看看这个有没有影响
+#看看按键是否正常，显示屏已写好
+
+
+
+#色块，置1，跟边线走，CCD3比重要大一点
+# CCD4或者CCD3外扩+Z轴陀螺仪小，置2
+# CCD3内收 + z轴陀螺仪小，置3
+# CCD3外扩 + z轴陀螺仪小，置4
+
