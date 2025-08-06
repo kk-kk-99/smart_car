@@ -13,4 +13,4 @@ openart色块辅助识别、串口互传；
 openart图像模型训练；
 
 实验室新赛道试跑
-<video src="https://github.com/kk-kk-99/smart_car/blob/main/%E6%96%B0%E8%B5%9B%E9%81%93.mp4" controls width="1000"></video> 
+<video src="https://github.com/kk-kk-99/smart_car/blob/main/%E6%96%B0%E8%B5%9B%E9%81%93.mp4" controls width="640"></video> 
