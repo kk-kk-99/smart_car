@@ -11,3 +11,4 @@ wifi使用；
 元素处理、十字、圆环、斑马线、坡道、路障；
 openart色块辅助识别、串口互传；
 openart图像模型训练；
+<video src="your-video.mp4" controls width="640"></video>
